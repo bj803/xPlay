@@ -1,0 +1,495 @@
+'use client';
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { useVideoPlayerStore } from '@/store/videoPlayer';
+import { FcRemoveImage } from 'react-icons/fc';
+import { VscRefresh } from 'react-icons/vsc';
+import { MdOutlineVideocamOff, MdFileDownload, MdShare, MdDriveFileMove } from 'react-icons/md';
+import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog';
+import { FolderSelectDialog } from '@/components/modules/FolderSelectDialog';
+import { toast } from 'react-toastify';
+import numeral from 'numeral';
+
+const SHARE_HOURS = [1, 6, 24, 72, 168];
+
+const GRID_CLASSES: Record<number, string> = {
+  2: 'grid grid-cols-2 gap-3',
+  3: 'grid grid-cols-2 sm:grid-cols-3 gap-3',
+  4: 'grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3',
+  5: 'grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3',
+};
+
+type LocalVideoFile = {
+  name: string;
+  path: string;
+  size: number;
+  mtime: string;
+  duration: number | null;
+  width: number | null;
+  height: number | null;
+  codecName: string | null;
+  fps: number | null;
+  title?: string | null;
+};
+
+type MetaInfo = {
+  duration: number | null;
+  width: number | null;
+  height: number | null;
+  codecName: string | null;
+  fps: number | null;
+};
+
+type LocalVideoGridProps = {
+  browsePath: string;
+  columns: number;
+  columnOptions?: number[];
+  onColumnChange?: (n: number) => void;
+  showColumnPicker?: boolean;
+  onToggleColumnPicker?: () => void;
+  onCloseColumnPicker?: () => void;
+  onFilesLoaded?: (files: LocalVideoFile[]) => void;
+  // Parent controls order + filtering via this sorted path list
+  sortedPaths?: string[];
+};
+
+// ── ThumbWithHoverPlay ────────────────────────────────────────
+function ThumbWithHoverPlay({ thumbUrl, streamUrl, onThumbLoad, onThumbError }: {
+  thumbUrl: string;
+  streamUrl: string;
+  onThumbLoad?: () => void;
+  onThumbError?: () => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const videoRef     = useRef<HTMLVideoElement | null>(null);
+  const [imgLoaded, setImgLoaded]   = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+
+  const handleMouseEnter = () => {
+    if (!containerRef.current || videoRef.current) return;
+    const v = document.createElement('video');
+    v.src = `${streamUrl}#t=3`;
+    v.className = 'absolute inset-0 w-full h-full object-cover';
+    v.muted = true;
+    v.playsInline = true;
+    v.preload = 'none';
+    containerRef.current.appendChild(v);
+    videoRef.current = v;
+    v.play().catch(() => {});
+  };
+
+  const handleMouseLeave = () => {
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.currentTime = 3;
+    }
+  };
+
+  const handleImgError = () => {
+    if (retryCount < 2) {
+      setTimeout(() => setRetryCount(n => n + 1), 1500 * (retryCount + 1));
+    } else {
+      onThumbError?.();
+    }
+  };
+
+  const imgSrc = retryCount > 0 ? `${thumbUrl}&r=${retryCount}` : thumbUrl;
+
+
+  const btn = 'border-0 bg-black/20 dark:bg-white/20 hover:bg-black/40 dark:hover:bg-white/40';
+  return (
+    <div
+      ref={containerRef}
+      className='relative w-full h-full'
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+    >
+      <img
+        key={imgSrc}
+        src={imgSrc}
+        alt=''
+        loading='lazy'
+        decoding='async'
+        className={`w-full h-full object-cover transition-opacity duration-200 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+        onLoad={() => { setImgLoaded(true); onThumbLoad?.(); }}
+        onError={handleImgError}
+      />
+      {!imgLoaded && <div className='absolute inset-0 bg-neutral-800 animate-pulse' />}
+    </div>
+  );
+}
+
+// ── LocalVideoGrid ────────────────────────────────────────────
+export function LocalVideoGrid({
+  browsePath,
+  columns,
+  columnOptions = [2, 3, 4, 5],
+  onColumnChange,
+  showColumnPicker = false,
+  onToggleColumnPicker,
+  onCloseColumnPicker,
+  onFilesLoaded,
+  sortedPaths,
+}: LocalVideoGridProps) {
+  const [files, setFiles]     = useState<LocalVideoFile[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState<string | null>(null);
+  const abortRef              = useRef<AbortController | null>(null);
+
+  const fetchFiles = useCallback(async (path: string) => {
+    if (abortRef.current) abortRef.current.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setLoading(true);
+    setError(null);
+    try {
+      const res  = await fetch(
+        `/api/local-files?path=${encodeURIComponent(path)}&meta=false`,
+        { signal: ctrl.signal },
+      );
+      const json = await res.json();
+      if (ctrl.signal.aborted) return;
+      const loaded: LocalVideoFile[] = json.files || [];
+      if (json.error && !json.files) {
+        setError(json.error);
+        setFiles([]);
+        onFilesLoaded?.([]);
+      } else {
+        setFiles(loaded);
+        onFilesLoaded?.(loaded);
+      }
+    } catch (e: any) {
+      if (e?.name === 'AbortError') return;
+      setError('无法加载文件列表');
+      setFiles([]);
+      onFilesLoaded?.([]);
+    } finally {
+      if (!ctrl.signal.aborted) setLoading(false);
+    }
+  }, [onFilesLoaded]);
+
+  useEffect(() => {
+    fetchFiles(browsePath);
+    return () => { if (abortRef.current) abortRef.current.abort(); };
+  }, [browsePath, fetchFiles]);
+
+  const invalidateThumb = (fp: string) =>
+    fetch(`/api/local-thumb?path=${encodeURIComponent(fp)}`, { method: 'DELETE' }).catch(() => {});
+
+  const handleDeleted = (fp: string) => {
+    invalidateThumb(fp);
+    setFiles(p => { const next = p.filter(f => f.path !== fp); onFilesLoaded?.(next); return next; });
+  };
+
+  const handleMoved = (fp: string) => {
+    invalidateThumb(fp);
+    setFiles(p => { const next = p.filter(f => f.path !== fp); onFilesLoaded?.(next); return next; });
+  };
+
+  // If parent passes sortedPaths, use that order (handles sort + search filtering).
+  // Otherwise show all files in load order.
+  const displayFiles: LocalVideoFile[] = sortedPaths
+    ? (sortedPaths
+        .map(p => files.find(f => f.path === p))
+        .filter((f): f is LocalVideoFile => f !== undefined))
+    : files;
+
+  const gridClass = GRID_CLASSES[columns] || GRID_CLASSES[3];
+
+  if (loading) return (
+    <div className={gridClass}>
+      {Array.from({ length: Math.min(columns * 2, 8) }).map((_, i) => (
+        <div key={i} className='rounded-lg overflow-hidden bg-card-nested'>
+          <Skeleton className='w-full aspect-video rounded-none' />
+          <div className='p-2 space-y-1.5'>
+            <Skeleton className='h-3.5 w-full' />
+            <Skeleton className='h-3.5 w-2/3' />
+            <Skeleton className='h-7 w-full mt-1' />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+
+  if (error) return (
+    <div className='flex flex-col items-center justify-center py-12 gap-3 text-muted-foreground'>
+      <p className='text-sm'>{error}</p>
+      <Button variant='outline' size='sm' onClick={() => fetchFiles(browsePath)}>
+        <VscRefresh className='mr-1' /> 重试
+      </Button>
+    </div>
+  );
+
+  if (displayFiles.length === 0) return (
+    <div className='flex flex-col items-center justify-center py-12 gap-3 text-muted-foreground'>
+      <FcRemoveImage className='text-5xl' />
+      <p className='text-sm'>{sortedPaths && sortedPaths.length === 0 && files.length > 0 ? '没有匹配的视频' : '该目录没有视频文件'}</p>
+    </div>
+  );
+
+  return (
+    <div className={gridClass}>
+      {displayFiles.map(file => (
+        <LocalVideoItem
+          key={file.path}
+          file={file}
+          onDeleted={handleDeleted}
+          onMoved={handleMoved}
+          onMetaLoaded={(fp, meta) =>
+            setFiles(p => p.map(f => f.path === fp ? { ...f, ...meta } : f))
+          }
+        />
+      ))}
+    </div>
+  );
+}
+
+// ── LocalVideoItem ────────────────────────────────────────────
+function LocalVideoItem({ file, onDeleted, onMoved, onMetaLoaded }: {
+  file: LocalVideoFile;
+  onDeleted: (p: string) => void;
+  onMoved:   (p: string) => void;
+  onMetaLoaded: (p: string, meta: MetaInfo) => void;
+}) {
+  const { open } = useVideoPlayerStore();
+  const [thumbError, setThumbError]       = useState(false);
+  const [openDeleteDialog, setOpenDelete] = useState(false);
+  const [openShareDialog,  setOpenShare]  = useState(false);
+  const [openMoveDialog,   setOpenMove]   = useState(false);
+  const [deleting, setDeleting]           = useState(false);
+  const [moving,   setMoving]             = useState(false);
+  const [shareHours, setShareHours]       = useState(24);
+  const [shareUrl,   setShareUrl]         = useState('');
+  const [shareSaved, setShareSaved]       = useState(false);
+  const [sharePassword, setSharePassword]   = useState('');
+  const [sharePassword, setSharePassword]   = useState('');
+
+  const thumbUrl    = `/api/local-thumb?path=${encodeURIComponent(file.path)}`;
+  const streamUrl   = `/api/local-stream?path=${encodeURIComponent(file.path)}`;
+  const displayName = file.name.replace(/\.[^/.]+$/, '');
+  const resolution  = file.height
+    ? `${file.height}p${file.fps ? Math.round(file.fps) : ''} ${file.codecName || ''}`
+    : null;
+
+  const handleThumbLoad = async () => {
+    if (file.duration !== null) return;
+    try {
+      const res  = await fetch(`/api/local-files?path=${encodeURIComponent(file.path)}&meta=true&single=true`);
+      const json = await res.json();
+      if (json.files?.[0]) {
+        const f = json.files[0];
+        onMetaLoaded(file.path, {
+          duration: f.duration, width: f.width, height: f.height,
+          codecName: f.codecName, fps: f.fps,
+        });
+      }
+    } catch {}
+  };
+
+  const handleClick = () =>
+    open({ uuid: file.path, title: file.title || displayName, url: streamUrl, type: 'video' });
+
+  const handleDelete = async () => {
+    setDeleting(true);
+    try {
+      const res  = await fetch(`/api/local-delete?path=${encodeURIComponent(file.path)}`, { method: 'DELETE' });
+      const json = await res.json();
+      if (json.success) {
+        toast.success(`已删除：${file.name}`);
+        setOpenDelete(false);
+        onDeleted(file.path);
+      } else {
+        toast.error(json.error || '删除失败');
+      }
+    } catch { toast.error('删除失败'); }
+    finally { setDeleting(false); }
+  };
+
+  const handleMove = async (targetSubdir: string) => {
+    setMoving(true);
+    try {
+      const res  = await fetch('/api/move-local-file', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ srcPath: file.path, targetSubdir: targetSubdir || undefined }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        toast.success(targetSubdir ? `已移动到 ${targetSubdir}` : '已移动到收藏根目录');
+        setOpenMove(false);
+        onMoved(file.path);
+      } else {
+        toast.error(json.error || '移动失败');
+      }
+    } catch { toast.error('移动失败'); }
+    finally { setMoving(false); }
+  };
+
+  const handleShare = async () => {
+    const expiresAt = shareHours > 0 ? Date.now() + shareHours * 3600 * 1000 : null;
+    try {
+      const res = await fetch('/api/share-records', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileName: file.name, filePath: file.path, expiresAt,
+          password: sharePassword.trim() || undefined }),
+      });
+      const json = await res.json();
+      if (json.success) {
+        const shareLink = window.location.origin + json.record.url;
+        setShareUrl(shareLink);
+        setShareSaved(true);
+      }
+    } catch {}
+  };
+
+  const btn = 'border-0 bg-black/20 dark:bg-white/20 hover:bg-black/40 dark:hover:bg-white/40';
+  return (
+    <>
+      <div className='flex flex-col h-full rounded-lg overflow-hidden bg-card-nested group'>
+        {/* Thumbnail */}
+        <div
+          className='relative w-full aspect-video flex-shrink-0 overflow-hidden bg-neutral-900 cursor-pointer'
+          onClick={handleClick}
+        >
+          {!thumbError ? (
+            <ThumbWithHoverPlay
+              thumbUrl={thumbUrl}
+              streamUrl={streamUrl}
+              onThumbLoad={handleThumbLoad}
+              onThumbError={() => setThumbError(true)}
+            />
+          ) : (
+            <div className='w-full h-full flex items-center justify-center text-4xl bg-neutral-800'>
+              <FcRemoveImage />
+            </div>
+          )}
+          {resolution && (
+            <div className='absolute top-1.5 left-1.5 text-xs bg-black/70 text-white px-1.5 py-0.5 rounded'>
+              {resolution}
+            </div>
+          )}
+          {file.duration !== null && (
+            <div className='absolute bottom-1.5 right-1.5 text-xs bg-black/80 text-white px-1.5 py-0.5 rounded'>
+              {numeral(file.duration).format('00:00:00')}
+            </div>
+          )}
+          {file.size > 0 && (
+            <div className='absolute bottom-1.5 left-1.5 text-xs bg-black/70 text-white px-1.5 py-0.5 rounded'>
+              {numeral(file.size).format('0.0b')}
+            </div>
+          )}
+        </div>
+
+        {/* Title + buttons */}
+        <div className='flex flex-col flex-1 p-2 gap-1.5'>
+          <p
+            className='text-sm font-semibold leading-tight line-clamp-2 break-all flex-1 cursor-pointer'
+            title={file.title || file.name}
+            onClick={handleClick}
+          >
+            {file.title || displayName}
+          </p>
+          <div className='flex items-center gap-1'>
+            <Button type='button' size='icon' variant='outline'
+              className={`h-7 w-7 shrink-0 text-base text-error-foreground ${btn}`}
+              title='删除文件'
+              onClick={e => { e.stopPropagation(); setOpenDelete(true); }}>
+              <MdOutlineVideocamOff />
+            </Button>
+            <Button type='button' size='icon' variant='outline'
+              className={`h-7 w-7 shrink-0 text-base ${btn}`}
+              title='分享链接'
+              onClick={e => { e.stopPropagation(); setShareUrl(''); setShareSaved(false); setSharePassword(''); setOpenShare(true); }}>
+              <MdShare />
+            </Button>
+            <Button type='button' size='icon' variant='outline'
+              className={`h-7 w-7 shrink-0 text-base ${btn}`}
+              title='移动到其他文件夹'
+              onClick={e => { e.stopPropagation(); setOpenMove(true); }}>
+              <MdDriveFileMove />
+            </Button>
+            <Button type='button' size='sm' variant='outline'
+              className={`flex-1 h-7 text-base p-0 ${btn}`}
+              title='下载到本地'
+              onClick={e => {
+                e.stopPropagation();
+                const a = document.createElement('a');
+                a.href = `/api/local-stream?path=${encodeURIComponent(file.path)}&download=true`;
+                a.download = file.name;
+                a.click();
+              }}>
+              <MdFileDownload />
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {/* Delete confirm */}
+      <Dialog open={openDeleteDialog} onOpenChange={setOpenDelete}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>确定删除这个文件？</DialogTitle></DialogHeader>
+          <p className='text-sm text-muted-foreground break-all'>{file.name}</p>
+          <p className='text-xs text-error-foreground'>此操作不可撤销。</p>
+          <DialogFooter className='flex flex-row justify-end gap-2'>
+            <Button variant='outline' size='sm' onClick={() => setOpenDelete(false)}>取消</Button>
+            <Button size='sm' className='bg-error hover:bg-error/90 text-foreground'
+              onClick={handleDelete} disabled={deleting}>
+              {deleting ? '删除中...' : '确认删除'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Move */}
+      <FolderSelectDialog
+        open={openMoveDialog}
+        onClose={() => setOpenMove(false)}
+        onConfirm={handleMove}
+        title='移动到其他文件夹'
+        description={file.title || file.name}
+        loading={moving}
+      />
+
+      {/* Share */}
+      <Dialog open={openShareDialog} onOpenChange={setOpenShare}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>分享视频链接</DialogTitle></DialogHeader>
+          <p className='text-sm text-muted-foreground break-all'>{file.title || file.name}</p>
+          <div className='space-y-3'>
+            <div>
+              <p className='text-xs text-muted-foreground mb-2'>链接有效期</p>
+              <div className='flex flex-wrap gap-2'>
+                {SHARE_HOURS.map(h => (
+                  <button key={h} type='button' onClick={() => setShareHours(h)}
+                    className={`text-xs px-3 py-1 rounded-full border transition-colors ${
+                      shareHours === h
+                        ? 'bg-primary text-primary-foreground border-primary'
+                        : 'bg-transparent text-muted-foreground border-border hover:border-primary/50'
+                    }`}>
+                    {h < 24 ? `${h}小时` : `${h / 24}天`}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {shareUrl ? (
+              <div className='space-y-2'>
+                <p className='text-xs text-muted-foreground'>
+                  {shareSaved ? '已保存到分享管理' : '分享链接'}
+                </p>
+                <div className='flex gap-2'>
+                  <input readOnly value={shareUrl}
+                    className='flex-1 text-xs bg-muted px-2 py-1.5 rounded border border-border'
+                    onClick={e => (e.target as HTMLInputElement).select()} />
+                  <Button size='sm' onClick={() => {
+                    navigator.clipboard.writeText(shareUrl);
+                    toast.success('链接已复制！');
+                  }}>复制</Button>
+                </div>
+              </div>
+            ) : (
+}
